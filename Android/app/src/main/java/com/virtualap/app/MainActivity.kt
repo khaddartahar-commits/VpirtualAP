@@ -34,7 +34,6 @@ import com.virtualap.app.ui.viewmodel.APViewModel
 import com.virtualap.app.ui.viewmodel.AppViewModel
 import com.virtualap.app.ui.viewmodel.InstallStatus
 import com.virtualap.app.util.AnimationUtils
-import com.virtualap.app.util.RootStatus
 
 private enum class Screen { WELCOME, ROOT_CHECK, LOADING, SETUP, MAIN, SETTINGS }
 
@@ -42,8 +41,7 @@ class MainActivity : AppCompatActivity() {
     private val askNotifications =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
-    /** Android 13+ hides the running notification until this is granted. Asked
-     *  once the main screen is up, so it never competes with the root prompt. */
+    /** Android 13+ hides the running notification until this is granted. */
     private fun askNotifications() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return
@@ -67,14 +65,9 @@ class MainActivity : AppCompatActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    // Settings is the one screen a tap opens. Everything else follows
-                    // the live root and install state, so root revoked in the
-                    // background or wiped binaries pull the user back to the gate
-                    // from wherever they are.
                     var settings by rememberSaveable { mutableStateOf(false) }
                     val screen = when {
                         !appVm.welcomeDone -> Screen.WELCOME
-                        appVm.rootStatus != RootStatus.Granted -> Screen.ROOT_CHECK
                         appVm.installStatus == InstallStatus.Checking -> Screen.LOADING
                         appVm.installStatus == InstallStatus.NotInstalled -> Screen.SETUP
                         settings -> Screen.SETTINGS
@@ -84,7 +77,6 @@ class MainActivity : AppCompatActivity() {
                         if (screen == Screen.MAIN || screen == Screen.SETTINGS) apVm.load()
                     }
                     BackHandler(enabled = screen == Screen.SETTINGS) { settings = false }
-                    // Pulled off Settings by the gate: come back to Main, not Settings.
                     LaunchedEffect(screen) {
                         if (screen != Screen.MAIN && screen != Screen.SETTINGS) settings = false
                     }
@@ -99,7 +91,7 @@ class MainActivity : AppCompatActivity() {
                             Screen.WELCOME -> WelcomeScreen(onDone = { appVm.finishWelcome() })
                             Screen.ROOT_CHECK -> RootCheckScreen(
                                 rootStatus = appVm.rootStatus,
-                                onCheck = { appVm.checkRoot(loud = true) }
+                                onCheck = { }
                             )
                             Screen.LOADING -> FullScreenLoading()
                             Screen.SETUP -> SetupScreen(onInstalled = { appVm.markInstalled() })
@@ -108,7 +100,7 @@ class MainActivity : AppCompatActivity() {
                                 MainScreen(
                                     vm = apVm,
                                     onNavigateToSettings = { settings = true },
-                                    onRefresh = { appVm.checkRoot() }
+                                    onRefresh = { apVm.load() }
                                 )
                             }
                             Screen.SETTINGS -> SettingsScreen(onBack = { settings = false })
