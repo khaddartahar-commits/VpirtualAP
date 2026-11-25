@@ -40,8 +40,6 @@ object Hotspot {
 
     private lateinit var app: Context
     private val logger = BackendLogger { level, msg -> actionLogs.add(level to msg) }
-    // The default status is a guess until the first refresh lands, so that
-    // first result always fans out even when it happens to equal the default.
     private var synced = false
 
     private const val CHANNEL = "hotspot"
@@ -49,9 +47,16 @@ object Hotspot {
 
     fun init(context: Context) {
         app = context.applicationContext
-        app.getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(CHANNEL, app.getString(R.string.notification_channel), NotificationManager.IMPORTANCE_LOW)
-        )
+        APManager.init(app)
+        runCatching {
+            app.getSystemService(NotificationManager::class.java)?.createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL,
+                    app.getString(R.string.notification_channel),
+                    NotificationManager.IMPORTANCE_LOW
+                )
+            )
+        }
     }
 
     /** The session's job, or null when nothing was started (busy, or the config cannot start). */
@@ -60,7 +65,8 @@ object Hotspot {
         enterPhase(Phase.STARTING)
         actionLogs.clear()
         return scope.launch {
-            if (!APManager.start(cfg, logger)) logFailure()
+            val ok = runCatching { APManager.start(cfg, logger) }.getOrDefault(false)
+            if (!ok) logFailure()
             settle()
         }
     }
@@ -70,7 +76,8 @@ object Hotspot {
         enterPhase(Phase.STOPPING)
         actionLogs.clear()
         return scope.launch {
-            if (!APManager.stop(logger)) logFailure()
+            val ok = runCatching { APManager.stop(logger) }.getOrDefault(false)
+            if (!ok) logFailure()
             settle()
         }
     }
@@ -78,7 +85,7 @@ object Hotspot {
     /** Re-read status; only a real change fans out to the tile and the
      *  notification, so the screen's 3 s poll cannot ping-pong with the tile. */
     suspend fun refresh(): APStatus {
-        val s = APManager.getStatus()
+        val s = runCatching { APManager.getStatus() }.getOrDefault(status)
         if (s != status || !synced) {
             synced = true
             status = s
@@ -88,13 +95,9 @@ object Hotspot {
         return s
     }
 
-    // The engine's start only returns once hostapd answered and the state file is written,
-    // and stop removes that file before it exits, so status is current at once.
-    // Fans out unconditionally: after a stop from the notification in a fresh
-    // process the new status equals the default and would not count as a change.
     private suspend fun settle() {
         synced = true
-        status = APManager.getStatus()
+        status = runCatching { APManager.getStatus() }.getOrDefault(status)
         enterPhase(Phase.IDLE)
         syncNotification()
     }
@@ -105,46 +108,45 @@ object Hotspot {
     }
 
     private fun syncTile() {
+        if (!::app.isInitialized) return
         runCatching {
             TileService.requestListeningState(app, ComponentName(app, HotspotTileService::class.java))
         }
     }
 
-    // ponytail: posted once per change, no process stays alive to watch hostapd.
-    // If it dies while nobody opens QS or the app, this stays up until the next
-    // refresh; Stop on a dead AP is harmless. Android 14 lets the user swipe it
-    // away, which only hides it. Promote to a foreground service if that bites.
     private fun syncNotification() {
-        val nm = app.getSystemService(NotificationManager::class.java)
-        if (!status.running) {
-            nm.cancel(NOTIFICATION_ID)
-            return
+        if (!::app.isInitialized) return
+        runCatching {
+            val nm = app.getSystemService(NotificationManager::class.java) ?: return
+            if (!status.running) {
+                nm.cancel(NOTIFICATION_ID)
+                return
+            }
+            val open = PendingIntent.getActivity(
+                app, 0,
+                Intent(app, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                PendingIntent.FLAG_IMMUTABLE
+            )
+            val stop = PendingIntent.getBroadcast(
+                app, 1, Intent(app, HotspotStopReceiver::class.java), PendingIntent.FLAG_IMMUTABLE
+            )
+            val clients = status.clients
+            val notification = NotificationCompat.Builder(app, CHANNEL)
+                .setSmallIcon(R.drawable.ic_wifi_tethering)
+                .setContentTitle(status.ssid ?: app.getString(R.string.app_name))
+                .setContentText(app.resources.getQuantityString(R.plurals.notification_clients, clients, clients))
+                .setContentIntent(open)
+                .addAction(0, app.getString(R.string.stop_ap), stop)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setCategory(NotificationCompat.CATEGORY_SERVICE)
+                .build()
+            nm.notify(NOTIFICATION_ID, notification)
         }
-        val open = PendingIntent.getActivity(
-            app, 0,
-            Intent(app, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-            PendingIntent.FLAG_IMMUTABLE
-        )
-        val stop = PendingIntent.getBroadcast(
-            app, 1, Intent(app, HotspotStopReceiver::class.java), PendingIntent.FLAG_IMMUTABLE
-        )
-        val clients = status.clients
-        val notification = NotificationCompat.Builder(app, CHANNEL)
-            .setSmallIcon(R.drawable.ic_wifi_tethering)
-            .setContentTitle(status.ssid ?: app.getString(R.string.app_name))
-            .setContentText(app.resources.getQuantityString(R.plurals.notification_clients, clients, clients))
-            .setContentIntent(open)
-            .addAction(0, app.getString(R.string.stop_ap), stop)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .build()
-        nm.notify(NOTIFICATION_ID, notification)
     }
 
-    /** The script's own [ERROR] lines already explain most failures; this
-     *  covers the exit code with no message (killed, missing binary). */
     private fun logFailure() {
+        if (!::app.isInitialized) return
         logger.log(Log.ERROR, app.getString(R.string.command_failed))
     }
 }
